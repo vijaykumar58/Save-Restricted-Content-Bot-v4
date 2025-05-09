@@ -1,4 +1,4 @@
- # Copyright (c) 2025 devgagan : https://github.com/devgaganin.
+# Copyright (c) 2025 devgagan : https://github.com/devgaganin.
 # Licensed under the GNU General Public License v3.0.
 # See LICENSE file in the repository root for full license text.
 
@@ -11,30 +11,23 @@ from pyrogram.errors import UserNotParticipant, MessageNotModified, RPCError
 from config import API_ID, API_HASH, LOG_GROUP, STRING, FORCE_SUB, FREEMIUM_LIMIT, PREMIUM_LIMIT
 from utils.func import get_user_data, screenshot, thumbnail, get_video_metadata
 from utils.func import get_user_data_key, process_text_with_rules, is_premium_user, E, get_display_name
-from shared_client import app as X # Alias Pyrogram client as X
-# Y is only needed if STRING is configured, fetched dynamically or use the global
-# from shared_client import userbot as Y # This might cause issues if STRING is not set
+# Import app, userbot, UB, and UC from shared_client
+from shared_client import app as X, userbot as Y, UB, UC # Import caches from shared_client
+from plugins.settings import rename_file # Import rename_file from settings
+from plugins.start import subscribe # Import subscribe from start
+from utils.custom_filters import login_in_progress # Import the custom filter
+from utils.encrypt import dcs
+import logging
 
-# Attempt to get userbot Y if STRING is configured, otherwise Y remains None
-Y = None
-if STRING:
-    try:
-        from shared_client import userbot as Y
-    except ImportError:
-        # Handle case where shared_client might not have userbot if STRING is None
-        pass
+# Removed UB and UC definitions - they are now in shared_client
 
-# Global state dictionaries (use with caution in high concurrency, but common for bots)
-Z: Dict[int, Dict[str, Any]] = {} # State for command sequence (batch/single)
-P: Dict[int, int] = {} # Progress tracking for upload/download messages {message_id: progress_step}
-UB: Dict[int, Client] = {} # Cache for user-specific bot clients {user_id: client_instance}
-UC: Dict[int, Client] = {} # Cache for user-specific user clients {user_id: client_instance}
 emp: Dict[Any, bool] = {} # Cache for empty chat status {chat_id: bool}
 
 ACTIVE_USERS: Dict[str, Dict[str, Any]] = {} # Track active batch/single tasks {user_id: task_info}
 ACTIVE_USERS_FILE = "active_users.json"
 
 # --- Helper functions for robustness ---
+# These helpers are needed here as they are used by prog and process_msg
 async def edit_message_safely(message: Message, text: str, reply_markup=None):
     """Helper function to edit message and handle errors like MessageNotModified"""
     try:
@@ -147,7 +140,7 @@ async def get_msg(bot_client: Client, user_client: Optional[Client], chat_identi
     """
     try:
         # Prioritize user client if available and link is private or requires user context
-        if user_client and link_type == 'private':
+        if user_client and user_client.is_connected and (link_type == 'private' or chat_identifier in UC.keys()): # Check if user_client is connected
              try:
                  # Ensure user client dialogs are updated for private chats
                  await upd_dlg(user_client)
@@ -160,24 +153,24 @@ async def get_msg(bot_client: Client, user_client: Optional[Client], chat_identi
                  # Or could try with bot client as a last resort, but it might fail for private chats.
                  # Sticking to the original logic's intent, if user_client fails for private, return None.
                  return None # User client failed for private link
-        elif link_type == 'public':
+        # If user client is not available, not connected, or link is public
+        elif bot_client and bot_client.is_connected: # Check if bot_client is connected
             try:
-                 # Use bot client for public links
+                 # Use bot client for public links or if user client is not available/connected
                  xm = await bot_client.get_messages(chat_identifier, message_id)
                  emp[chat_identifier] = getattr(xm, "empty", False) # Cache empty status
                  if emp[chat_identifier]:
                      # If message is empty (maybe due to joining), try joining and refetching with user client if possible
-                     if user_client:
+                     if user_client and user_client.is_connected: # Check if user_client is available and connected
                          try: await user_client.join_chat(chat_identifier) # Join with user client
                          except Exception: pass # Ignore join errors
                          # Try fetching with user client after joining
-                         xm = await user_client.get_messages((await user_client.get_chat(chat_identifier)).id, message_id)
-                     else:
-                          # If no user client, maybe the bot client can join and fetch? (Less likely for public join needed)
-                          # The original code attempts to refetch with user client implicitly if emp is True.
-                          # Let's stick closer to that: if empty and user_client exists, try user_client.
-                          # If still empty or no user_client, the original xm (likely None or Empty) is returned.
-                          pass # No user client to attempt re-fetch after empty check
+                         try:
+                             xm = await user_client.get_messages((await user_client.get_chat(chat_identifier)).id, message_id)
+                         except Exception as e:
+                             print(f"Re-fetch with user client after empty failed: {e}")
+                             pass # Keep the original xm (likely None or Empty)
+
                  return xm
             except Exception as e:
                  print(f'Error fetching public message {chat_identifier}/{message_id} with bot client: {e}')
@@ -185,16 +178,14 @@ async def get_msg(bot_client: Client, user_client: Optional[Client], chat_identi
                  # Original code doesn't have a clear fallback here. Return None on error.
                  return None
         else:
-            # Default case or unexpected link type, try with bot client
-            try:
-                return await bot_client.get_messages(chat_identifier, message_id)
-            except Exception as e:
-                print(f"Error fetching message {chat_identifier}/{message_id} with fallback bot client: {e}")
-                return None
+            print("Neither bot client nor user client is connected to fetch message.")
+            return None # No client available or connected
 
     except Exception as e:
         print(f'General Error in get_msg for {chat_identifier}/{message_id}: {e}')
         return None
+
+# UB and UC are now imported from shared_client
 
 async def get_ubot(uid: int) -> Optional[Client]:
     """Retrieves or creates a user's dedicated bot client."""
@@ -233,7 +224,7 @@ async def get_uclient(uid: int) -> Optional[Client]:
             # Ensure unique session name for each user client
             gg = Client(f'{uid}_user_client', api_id=API_ID, api_hash=API_HASH, device_model="v3saver", session_string=ss, in_memory=True)
             await gg.start()
-            await upd_dlg(gg) # Update dialogs for the new client
+            # await upd_dlg(gg) # Update dialogs for the new client - done within get_msg if needed
             UC[uid] = gg
             return gg
         except Exception as e:
@@ -272,7 +263,7 @@ async def prog(current: int, total: int, client: Client, chat_id: int, message_i
         bar = '🟢' * int(p / 10) + '🔴' * (10 - int(p / 10))
         # Avoid division by zero
         speed_bytes_sec = (current / (time.time() - start_time)) if (time.time() - start_time) > 0 else 0
-        speed_mb_sec = speed_bytes_sec / (1024 * 1024)
+        speed_mb_sec = speed_bytes_sec / (1024 * 1024) if speed_bytes_sec > 0 else 0 # Ensure speed_mb_sec is not inf or NaN
         # Avoid division by zero for ETA
         eta = time.strftime('%M:%S', time.gmtime((total - current) / speed_bytes_sec)) if speed_bytes_sec > 0 else 'Calculating...'
 
@@ -288,6 +279,7 @@ async def prog(current: int, total: int, client: Client, chat_id: int, message_i
 
         # Use the safe edit function
         try:
+            # prog function receives client, chat_id, message_id directly
             await client.edit_message_text(chat_id, message_id, progress_text)
         except MessageNotModified:
             pass # Ignore if text is the same
@@ -317,7 +309,7 @@ async def send_direct(c: Client, m: Message, target_chat_id: int, caption_text: 
             await c.send_audio(target_chat_id, m.audio.file_id, caption=caption_text, duration=m.audio.duration, performer=m.audio.performer, title=m.audio.title, reply_to_message_id=reply_to_message_id)
         elif m.photo:
             # Photos can have multiple sizes, using the largest one
-            photo_id = m.photo.file_id if hasattr(m.photo, 'file_id') else m.photo.sizes[-1].file_id if m.photo.sizes else None
+            photo_id = m.photo.file_id if hasattr(m.photo, 'file_id') else m.photo.sizes[-1].file_id if hasattr(m.photo, 'sizes') and m.photo.sizes else None
             if photo_id:
                  await c.send_photo(target_chat_id, photo_id, caption=caption_text, reply_to_message_id=reply_to_message_id)
             else:
@@ -337,6 +329,10 @@ async def send_direct(c: Client, m: Message, target_chat_id: int, caption_text: 
 # --- Message Processing (Download, Rename, Upload) ---
 async def process_msg(bot_client: Client, user_client: Optional[Client], message: Message, destination_chat_id: str, link_type: str, user_id: int, source_chat_identifier: Any) -> str:
     """Processes a single message: downloads, renames, and uploads."""
+    download_progress_msg = None # Initialize to None
+    renamed_file = None # Initialize to None
+    thumb_path = None # Initialize to None
+
     try:
         # Determine the actual target chat ID and reply message ID from user settings
         cfg_chat = await get_user_data_key(user_id, 'chat_id', None)
@@ -369,8 +365,10 @@ async def process_msg(bot_client: Client, user_client: Optional[Client], message
             # Try sending directly using file_id if possible (e.g., public channels, not restricted)
             # Note: Direct send might not work for restricted content even from public channels sometimes
             if link_type == 'public' and not emp.get(source_chat_identifier, False):
-                 # Check if message is restricted - direct send usually fails for restricted
-                 if not getattr(message, 'web_page', None) and not message.empty and (message.text or message.caption): # Basic check for non-restricted-looking messages
+                 # Check if message is restricted (basic check) - direct send usually fails for restricted
+                 # If message has web_page, it's likely linked media, which might be restricted.
+                 # If message is empty, it's definitely restricted content.
+                 if not getattr(message, 'web_page', None) and not message.empty: # Basic check for non-restricted-looking messages
                       if await send_direct(bot_client, message, target_chat_id, final_caption, reply_to_message_id):
                            return 'Sent directly.'
                  # If direct send fails or message looks restricted, proceed to download/upload
@@ -382,17 +380,19 @@ async def process_msg(bot_client: Client, user_client: Optional[Client], message
 
             # Download the media using the user client (preferred for restricted content)
             # Fallback to bot client if user client is not available or fails
-            client_to_use = user_client if user_client else bot_client
+            client_to_use = user_client if user_client and user_client.is_connected else bot_client if bot_client and bot_client.is_connected else None
+
             if not client_to_use:
                  await edit_message_safely(download_progress_msg, 'Error: No client available for download.')
                  return 'Failed.'
 
+            downloaded_file = None # Initialize
             try:
                  # Download the file
                  downloaded_file = await client_to_use.download_media(
                      message,
                      progress=prog, # Pass the progress callback
-                     progress_args=(bot_client, target_chat_id, download_progress_msg.id, start_time)
+                     progress_args=(bot_client, target_chat_id, download_progress_msg.id, start_time) # Pass bot_client for editing
                  )
             except Exception as e:
                  await edit_message_safely(download_progress_msg, f'Download failed: {str(e)[:50]}')
@@ -425,28 +425,53 @@ async def process_msg(bot_client: Client, user_client: Optional[Client], message
             # The global userbot (Y) might be the only client capable of uploading >2GB.
             if file_size_gb > 2 and Y and Y.is_connected:
                 await edit_message_safely(download_progress_msg, 'File is larger than 2GB. Using alternative upload method...')
-                # Ensure global userbot dialogs are updated
-                await upd_dlg(Y)
+                # Ensure global userbot dialogs are updated - done within get_msg if userbot is used for fetching
+                # await upd_dlg(Y) # Maybe not needed here if userbot is only used for uploading
 
-                # Get video metadata and screenshot for the large file
-                mtd = await get_video_metadata(renamed_file)
-                duration, height, width = mtd.get('duration', 0), mtd.get('height', 1), mtd.get('width', 1)
-                thumb_path = await screenshot(renamed_file, duration, user_id) if duration > 0 else None
+                # Get video metadata and screenshot for the large file if it's a video
+                duration, height, width = 0, 1, 1 # Default values
+                if renamed_file.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm', '.mpeg', '.mpg', '.3gp')): # Check if it's a video file by extension
+                    mtd = await get_video_metadata(renamed_file)
+                    duration, height, width = mtd.get('duration', 0), mtd.get('height', 1), mtd.get('width', 1)
+
+                thumb_path = None
+                # Try getting a thumbnail (screenshot for video, or potentially user-set thumb)
+                if duration > 0: # Only attempt screenshot if it's a video with duration
+                    thumb_path = await screenshot(renamed_file, duration, user_id)
+                # Could also check for user-set thumbnail here if screenshot fails or for non-videos
+                if not thumb_path and thumbnail(user_id):
+                     thumb_path = thumbnail(user_id)
+
 
                 sent_message_in_log = None
                 try:
                     # Upload the large file to the log group using the global userbot
                     # Use the same progress callback logic, adapting arguments
                     log_upload_start_time = time.time()
-                    sent_message_in_log = await Y.send_document(
-                         LOG_GROUP,
-                         renamed_file,
-                         thumb=thumb_path,
-                         caption=final_caption,
-                         # reply_to_message_id=... if needed for log group threading
-                         progress=prog,
-                         progress_args=(Y, LOG_GROUP, download_progress_msg.id, log_upload_start_time) # Pass log group details for progress
-                    )
+                    # Determine if it's a video to send as video, otherwise send as document
+                    if duration > 0:
+                        sent_message_in_log = await Y.send_video(
+                            LOG_GROUP,
+                            video=renamed_file,
+                            thumb=thumb_path,
+                            caption=final_caption,
+                            duration=duration,
+                            width=width,
+                            height=height,
+                            supports_streaming=True,
+                            progress=prog,
+                            progress_args=(Y, LOG_GROUP, download_progress_msg.id, log_upload_start_time) # Pass Y client for editing log message
+                        )
+                    else:
+                         sent_message_in_log = await Y.send_document(
+                            LOG_GROUP,
+                            document=renamed_file,
+                            thumb=thumb_path,
+                            caption=final_caption,
+                            file_name=os.path.basename(renamed_file),
+                            progress=prog,
+                            progress_args=(Y, LOG_GROUP, download_progress_msg.id, log_upload_start_time) # Pass Y client for editing log message
+                        )
                     print(f"Uploaded large file to log group {LOG_GROUP}, message ID: {sent_message_in_log.id}")
                 except Exception as e:
                      print(f"Error uploading large file to log group: {e}")
@@ -470,11 +495,7 @@ async def process_msg(bot_client: Client, user_client: Optional[Client], message
                         await edit_message_safely(download_progress_msg, f'Copying large file failed: {str(e)[:50]}')
                 else:
                     # Upload to log group failed
-                     if os.path.exists(renamed_file): os.remove(renamed_file)
-                     if thumb_path and os.path.exists(thumb_path): os.remove(thumb_path)
-                     await delete_message_safely(download_progress_msg)
-                     return 'Failed (Large file upload).'
-
+                     pass # Error already reported
 
             # --- Handle Standard Files (<= 2GB) ---
             else:
@@ -482,17 +503,26 @@ async def process_msg(bot_client: Client, user_client: Optional[Client], message
                 upload_start_time = time.time()
 
                 # Get video metadata and screenshot if it's a video and needed
+                duration, height, width = 0, 1, 1 # Default values
                 thumb_path = None
-                if message.video:
+
+                # Determine media type and get specific metadata/thumbnail
+                if message.video or renamed_file.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm', '.mpeg', '.mpg', '.3gp')):
                     mtd = await get_video_metadata(renamed_file)
                     duration, height, width = mtd.get('duration', 0), mtd.get('height', 1), mtd.get('width', 1)
-                    thumb_path = await screenshot(renamed_file, duration, user_id) if duration > 0 else None
+                    if duration > 0:
+                        thumb_path = await screenshot(renamed_file, duration, user_id)
                 elif message.audio:
                      # For audio, try to get thumbnail from ytdl info if available, or use a default/user-set one
                      # The ytdl.py handles audio thumbnails better. For Telegram audio, no built-in thumb usually.
                      # Could potentially use the user's set thumbnail here if no other thumb is available.
                      thumb_path = thumbnail(user_id) # Check for user-set thumbnail
-
+                elif message.photo:
+                     # For photos, check for user-set thumbnail if needed
+                     thumb_path = thumbnail(user_id)
+                elif message.document:
+                     # For documents, check for user-set thumbnail
+                     thumb_path = thumbnail(user_id)
 
                 try:
                     # Upload the file using the bot client (usually sufficient for <=2GB)
@@ -610,14 +640,14 @@ async def process_msg(bot_client: Client, user_client: Optional[Client], message
         # Catch any unexpected errors during the entire process_msg execution
         print(f'Unexpected Error processing message {message.id}: {e}')
         # Attempt to clean up downloaded file if it exists
-        if 'renamed_file' in locals() and os.path.exists(renamed_file):
+        if renamed_file and os.path.exists(renamed_file):
              os.remove(renamed_file)
-        if 'downloaded_file' in locals() and os.path.exists(downloaded_file):
+        elif 'downloaded_file' in locals() and downloaded_file and os.path.exists(downloaded_file):
              os.remove(downloaded_file)
-        if 'thumb_path' in locals() and thumb_path and os.path.exists(thumb_path):
+        if thumb_path and os.path.exists(thumb_path):
              os.remove(thumb_path)
         # Attempt to edit/delete the progress message if it exists
-        if 'download_progress_msg' in locals():
+        if download_progress_msg:
             await edit_message_safely(download_progress_msg, f'An unexpected error occurred: {str(e)[:50]}')
             # Decide whether to keep or delete the error message
             # await delete_message_safely(download_progress_msg)
@@ -625,6 +655,7 @@ async def process_msg(bot_client: Client, user_client: Optional[Client], message
 
 
 # --- Command Handlers ---
+# Added & filters.private to command handlers as they are user-initiated
 @X.on_message(filters.command(['batch', 'single']) & filters.private & ~login_in_progress)
 async def process_cmd(c: Client, m: Message):
     """Handles /batch and /single commands."""
@@ -652,21 +683,13 @@ async def process_cmd(c: Client, m: Message):
         await edit_message_safely(pro, 'You have an active task. Use /stop to cancel it.')
         return
 
-    # Check if user has set up a custom bot (required for processing)
-    ubot = await get_ubot(user_id)
-    # Also check if the global userbot is available as a fallback for user clients
-    uc = await get_uclient(user_id) # Get user client (might return global userbot)
+    # Check if user has set up a custom bot or has a user session
+    ubot = await get_ubot(user_id) # Get user's bot client
+    uc = await get_uclient(user_id) # Get user client (might be global userbot)
 
-    if not ubot and not uc:
-         # If neither a user's bot nor a user client (or global userbot) is available
-         await edit_message_safely(pro, 'Please add your bot with /setbot or login with /login first.')
-         return
-    # At least one client (user bot or user client/global userbot) is needed to fetch messages.
-    # get_msg prioritizes user_client, so having uc is more critical for private content.
-    # However, even ubot can fetch some public content. The check above is a bit loose.
-    # Let's refine: for processing, at least a userbot or a user client is needed.
-    if not ubot and not (uc and uc.is_connected):
-         await edit_message_safely(pro, 'Please add your bot with /setbot or login with /login first.')
+    # Need at least a user bot or a user client (or the global userbot Y) that is connected
+    if (not ubot or not ubot.is_connected) and (not uc or not uc.is_connected):
+         await edit_message_safely(pro, 'Cannot proceed without a connected bot or user client. Use /setbot or /login.')
          return
 
     # Start the command sequence state
@@ -677,7 +700,7 @@ async def process_cmd(c: Client, m: Message):
 
 @X.on_message(filters.command(['cancel', 'stop']) & filters.private)
 async def cancel_cmd(c: Client, m: Message):
-    """Handles /cancel and /stop commands to cancel an active task."""
+    """Handles /cancel and /stop commands to cancel an active task or command sequence."""
     user_id = m.from_user.id
 
     if is_user_active(user_id):
@@ -689,13 +712,17 @@ async def cancel_cmd(c: Client, m: Message):
                   await m.reply_text('Failed to request cancellation. Please try again.')
         else:
              await m.reply_text('No active task found or cancellation already requested.')
+    elif user_id in Z:
+         # If not in an active batch task, check if in a command sequence setup
+         # Get the progress message to edit its text
+         progress_msg = Z[user_id].get('progress_msg')
+         del Z[user_id] # Cancel the command sequence
+         if progress_msg:
+              await edit_message_safely(progress_msg, '✅ Command sequence cancelled.')
+         else:
+              await m.reply_text('✅ Command sequence cancelled.')
     else:
-        # Also check if the user is in a command sequence (login or batch/single setup)
-        if user_id in Z:
-            del Z[user_id] # Cancel the command sequence
-            await m.reply_text('Command sequence cancelled.')
-        else:
-            await m.reply_text('No active task or command sequence found.')
+        await m.reply_text('ℹ️ No active task or command sequence found to cancel.')
 
 
 @X.on_message(filters.text & filters.private & ~login_in_progress & ~filters.command([
@@ -709,45 +736,55 @@ async def text_handler(c: Client, m: Message):
     if user_id not in Z:
         # If user is not in a command sequence, ignore the text message
         # Or potentially forward it to a log/support group if needed
+        print(f"Ignoring text from user {user_id} outside of command sequence.")
         return
 
     s = Z[user_id].get('step')
     progress_msg = Z[user_id].get('progress_msg') # Get the initial progress message
 
+    # Delete the user's input message for cleanliness, unless it's needed later
+    # Be cautious with deleting messages, might fail if bot doesn't have permissions
+    try:
+        await m.delete()
+    except Exception:
+        pass # Ignore deletion errors
+
+
     if s == 'start':
         # User is expected to send the start link for batch processing
-        link = m.text
+        link = m.text.strip() # Strip whitespace
         chat_identifier, start_id, link_type = E(link) # Parse the link
         if not chat_identifier or start_id is None: # Check if parsing was successful
-            await edit_message_safely(progress_msg, 'Invalid link format.')
+            await edit_message_safely(progress_msg, '❌ Invalid link format.')
             del Z[user_id]
             return
 
         Z[user_id].update({'step': 'count', 'cid': chat_identifier, 'sid': start_id, 'lt': link_type})
-        await edit_message_safely(progress_msg, 'How many messages?')
+        await edit_message_safely(progress_msg, '✅ Link received. How many messages?')
 
     elif s == 'start_single':
         # User is expected to send the link for single message processing
-        link = m.text
+        link = m.text.strip() # Strip whitespace
         chat_identifier, message_id, link_type = E(link) # Parse the link
         if not chat_identifier or message_id is None: # Check if parsing was successful
-            await edit_message_safely(progress_msg, 'Invalid link format.')
+            await edit_message_safely(progress_msg, '❌ Invalid link format.')
             del Z[user_id]
             return
 
         Z[user_id].update({'step': 'process_single', 'cid': chat_identifier, 'sid': message_id, 'lt': link_type})
 
         # Start processing the single message immediately
-        await edit_message_safely(progress_msg, 'Processing single message...')
+        await edit_message_safely(progress_msg, '✅ Link received. Processing single message...')
 
         ubot = await get_ubot(user_id) # Get user's bot client
         uc = await get_uclient(user_id) # Get user client (might be global userbot)
 
-        # Check if at least one client is available for fetching
-        if not ubot and not (uc and uc.is_connected):
-            await edit_message_safely(progress_msg, 'Cannot proceed without a bot or user client. Use /setbot or /login.')
+        # Need at least a user bot or a user client (or the global userbot Y) that is connected
+        if (not ubot or not ubot.is_connected) and (not uc or not uc.is_connected):
+            await edit_message_safely(progress_msg, 'Cannot proceed without a connected bot or user client. Use /setbot or /login.')
             del Z[user_id]
             return
+
 
         # Add to active users to prevent other tasks
         await add_active_batch(user_id, {
@@ -763,10 +800,10 @@ async def text_handler(c: Client, m: Message):
                 res = await process_msg(ubot, uc, msg, str(m.chat.id), link_type, user_id, chat_identifier) # Pass user_id and source_chat_identifier
                 await edit_message_safely(progress_msg, f'Single message process: {res}')
             else:
-                await edit_message_safely(progress_msg, 'Message not found or inaccessible.')
+                await edit_message_safely(progress_msg, 'ℹ️ Message not found or inaccessible.')
         except Exception as e:
             print(f"Error during single message processing for user {user_id}: {e}")
-            await edit_message_safely(progress_msg, f'Error processing message: {str(e)[:50]}')
+            await edit_message_safely(progress_msg, f'❌ Error processing message: {str(e)[:50]}')
         finally:
             # Clean up state regardless of success/failure
             await remove_active_batch(user_id)
@@ -776,7 +813,7 @@ async def text_handler(c: Client, m: Message):
     elif s == 'count':
         # User is expected to send the number of messages for batch processing
         if not m.text.isdigit():
-            await edit_message_safely(progress_msg, 'Invalid input. Please enter a valid number.')
+            await edit_message_safely(progress_msg, '❌ Invalid input. Please enter a valid number.')
             return # Stay in this step until valid input
 
         count = int(m.text)
@@ -784,11 +821,11 @@ async def text_handler(c: Client, m: Message):
         max_limit = PREMIUM_LIMIT if is_prem else FREEMIUM_LIMIT
 
         if count <= 0:
-             await edit_message_safely(progress_msg, 'Number of messages must be positive.')
+             await edit_message_safely(progress_msg, '❌ Number of messages must be positive.')
              return # Stay in this step
 
         if count > max_limit:
-            await edit_message_safely(progress_msg, f'Maximum limit is {max_limit}. You are a {"Premium" if is_prem else "Freemium"} user.')
+            await edit_message_safely(progress_msg, f'❌ Maximum limit is {max_limit}. You are a {"Premium" if is_prem else "Freemium"} user.')
             return # Stay in this step
 
         # Valid count received, move to process step
@@ -796,14 +833,14 @@ async def text_handler(c: Client, m: Message):
         chat_identifier, start_id, num_messages, link_type = Z[user_id]['cid'], Z[user_id]['sid'], Z[user_id]['num'], Z[user_id]['lt']
         success_count = 0 # Initialize success counter
 
-        await edit_message_safely(progress_msg, f'Starting batch processing for {num_messages} messages...')
+        await edit_message_safely(progress_msg, f'✅ Count received. Starting batch processing for {num_messages} messages...')
 
         ubot = await get_ubot(user_id) # Get user's bot client
         uc = await get_uclient(user_id) # Get user client (might be global userbot)
 
-        # Check if at least one client is available for fetching
-        if not ubot and not (uc and uc.is_connected):
-            await edit_message_safely(progress_msg, 'Cannot proceed without a bot or user client. Use /setbot or /login.')
+        # Need at least a user bot or a user client (or the global userbot Y) that is connected
+        if (not ubot or not ubot.is_connected) and (not uc or not uc.is_connected):
+            await edit_message_safely(progress_msg, 'Cannot proceed without a connected bot or user client. Use /setbot or /login.')
             del Z[user_id]
             return
 
@@ -837,16 +874,16 @@ async def text_handler(c: Client, m: Message):
                         if 'Done' in res or 'Sent' in res: # 'Copied' is for large file copy
                              success_count += 1
                         # Update the progress message with current item status (optional but helpful)
-                        await edit_message_safely(progress_msg, f'Processing {j+1}/{num_messages}: {res}')
+                        await edit_message_safely(progress_msg, f'Processing {j+1}/{num_messages} (Msg ID: {current_message_id}): {res}')
                     else:
                          # Message not found or inaccessible, update progress message
-                         await edit_message_safely(progress_msg, f'Processing {j+1}/{num_messages}: Message {current_message_id} not found or inaccessible.')
+                         await edit_message_safely(progress_msg, f'Processing {j+1}/{num_messages} (Msg ID: {current_message_id}): ℹ️ Message not found or inaccessible.')
                          pass # Continue to the next message even if one fails
 
                 except Exception as e:
                     # Catch errors specific to fetching or processing a single message
                     print(f"Error processing message {current_message_id} in batch for user {user_id}: {e}")
-                    await edit_message_safely(progress_msg, f'Processing {j+1}/{num_messages}: Error - {str(e)[:50]}')
+                    await edit_message_safely(progress_msg, f'Processing {j+1}/{num_messages} (Msg ID: {current_message_id}): ❌ Error - {str(e)[:50]}')
                     # Decide whether to continue or break on error - continuing allows processing other messages
 
                 # Add a small delay between processing messages to avoid hitting API limits
@@ -856,13 +893,13 @@ async def text_handler(c: Client, m: Message):
             # After the loop finishes (either completed or cancelled)
             if not should_cancel(user_id):
                  # If the loop completed without cancellation
-                 await m.reply_text(f'Batch Completed ✅ Processed: {num_messages}. Successful: {success_count}/{num_messages}')
+                 await m.reply_text(f'Batch Completed ✅ Processed: {num_messages}. Successful: {success_count}/{num_messages}.')
             # If cancelled, the cancellation message is already sent
 
         except Exception as e:
              # Catch any unexpected errors during the batch loop setup or iteration
              print(f"Unexpected error during batch processing for user {user_id}: {e}")
-             await edit_message_safely(progress_msg, f'An unexpected error occurred during batch processing: {str(e)[:50]}')
+             await edit_message_safely(progress_msg, f'❌ An unexpected error occurred during batch processing: {str(e)[:50]}')
 
         finally:
             # Clean up active batch state regardless of how the process ended
@@ -872,6 +909,3 @@ async def text_handler(c: Client, m: Message):
 
 
     # No other steps defined for the command sequence currently
-
-# Note: The filter `~login_in_progress` is applied to process_cmd and text_handler
-# to prevent these handlers from interfering with the login flow in plugins/login.py
