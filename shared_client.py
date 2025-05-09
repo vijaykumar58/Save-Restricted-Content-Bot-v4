@@ -3,10 +3,14 @@
 # See LICENSE file in the repository root for full license text.
 
 from telethon import TelegramClient
+from telethon.errors import FloodWaitError as TelethonFloodWaitError # Rename to avoid conflict
 from config import API_ID, API_HASH, BOT_TOKEN, STRING
 from pyrogram import Client
+from pyrogram.errors import FloodWait as PyrogramFloodWait # Specific Pyrogram FloodWait
 import sys
+import asyncio # Import asyncio for sleep
 from typing import Dict, Any # Import for type hinting
+import time # Import time for logging wait duration
 
 # Initialize clients (these are the primary clients used by the bot)
 client = TelegramClient("telethonbot", API_ID, API_HASH) # Telethon client
@@ -28,40 +32,50 @@ UC: Dict[int, Client] = {} # Cache for user-specific user clients {user_id: clie
 
 
 async def start_client():
-    """Starts the Telethon and Pyrogram clients."""
+    """Starts the Telethon and Pyrogram clients with FloodWait retry logic."""
     print("Starting clients ...")
-    # Start the main Telethon client
+
+    clients_to_start = []
     if not client.is_connected():
-        try:
-            await client.start(bot_token=BOT_TOKEN)
-            print("SpyLib (Telethon client) started...")
-        except Exception as e:
-            print(f"Error starting Telethon client: {e}", file=sys.stderr)
-            # Depending on criticality, you might want to sys.exit(1) here
-
-    # Start the global userbot if configured and initialized
+        clients_to_start.append(('Telethon client', client, TelethonFloodWaitError))
+    if app and not app.is_connected:
+         clients_to_start.append(('Pyrogram client', app, PyrogramFloodWait))
     if userbot and not userbot.is_connected:
-        try:
-            await userbot.start()
-            print("Global Userbot started...")
-        except Exception as e:
-            print(f"Hey honey!! check your premium string session, it may be invalid or expire: {e}", file=sys.stderr)
-            # The original code sys.exit(1) here, deciding whether to be strict or allow bot without userbot
-            # sys.exit(1) # Uncomment to exit if global userbot fails
+         clients_to_start.append(('Global Userbot', userbot, PyrogramFloodWait)) # Assuming userbot uses Pyrogram
 
-    # Start the main Pyrogram client (aliased as 'app')
-    if not app.is_connected:
-        try:
-            await app.start()
-            print("Pyro App Started...")
-        except Exception as e:
-            print(f"Error starting Pyrogram client: {e}", file=sys.stderr)
-            # Depending on criticality, you might want to sys.exit(1) here
-            # sys.exit(1) # Uncomment to exit if Pyrogram client fails
+    # Retry logic for starting each client
+    for client_name, client_instance, flood_wait_error_type in clients_to_start:
+        retries = 0
+        max_retries = 5 # Limit the number of retries
+        while retries < max_retries:
+            try:
+                print(f"Attempting to start {client_name} (Attempt {retries + 1}/{max_retries})...")
+                if client_name == 'Telethon client':
+                    await client_instance.start(bot_token=BOT_TOKEN) # Telethon start needs bot_token if bot
+                else:
+                    await client_instance.start() # Pyrogram start
+                print(f"{client_name} started...")
+                break # Exit the retry loop if successful
+            except flood_wait_error_type as e:
+                wait_time = getattr(e, 'seconds', getattr(e, 'value', 60)) # Get wait time (Telethon vs Pyrogram)
+                print(f"FloodWait for {client_name}: Need to wait {wait_time} seconds. Retrying in {min(wait_time + 5, 600)} seconds...", file=sys.stderr) # Add a small buffer, cap wait
+                await asyncio.sleep(min(wait_time + 5, 600)) # Wait and cap the wait time
+                retries += 1
+            except Exception as e:
+                print(f"Error starting {client_name}: {e}", file=sys.stderr)
+                # Decide if other errors should trigger retry or stop
+                # For now, let's not retry on non-FloodWait errors during startup
+                break # Exit the retry loop on other errors
 
-    # Clients are started. They will now listen for updates.
-    # No need to return them, they are accessible globally via the module.
-    # return client, app, userbot # Returning is optional if they are used globally
+        if retries == max_retries:
+             print(f"Failed to start {client_name} after {max_retries} attempts due to FloodWait or other error.", file=sys.stderr)
+             # Depending on criticality, you might want to sys.exit(1) here
+             # if client_name in ['Telethon client', 'Pyrogram client']: sys.exit(1)
+
+
+    # Clients are started (or failed to start after retries).
+    # They will now listen for updates if successful.
+
 
 # Note: Individual user clients (UC) and user bots (UB) are started on demand
 # in plugin code (like plugins/login.py or plugins/batch.py) and cached in UB/UC.
