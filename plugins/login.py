@@ -4,9 +4,10 @@
 
 from pyrogram import Client, filters
 from pyrogram.types import Message
-from pyrogram.errors import BadRequest, SessionPasswordNeeded, PhoneCodeInvalid, PhoneCodeExpired, MessageNotModified, RPCError
+from pyrogram.errors import BadRequest, SessionPasswordNeeded, PhoneCodeInvalid, PhoneCodeExpired, MessageNotModified, RPCError, FloodWait
 import logging
 import os
+import re # Import re for regex validation
 from config import API_HASH, API_ID
 from shared_client import app as bot # Alias Pyrogram client as bot
 # Import UB and UC from shared_client
@@ -76,13 +77,7 @@ async def set_bot_token(C: Client, m: Message):
             if UB[user_id] and UB[user_id].is_connected: # Check if client exists and is connected
                 await UB[user_id].stop()
                 print(f"Stopped old bot for user {user_id}")
-            del UB[user_id]  # Remove from dictionary
-            # Consider removing the session file if it was persisted (in_memory=True reduces this need)
-            # try:
-            #     session_file = f"user_{user_id}.session"
-            #     if os.path.exists(session_file):
-            #          os.remove(session_file)
-            # except Exception: pass
+            del UB[user_id] # Remove from dictionary - FIXED: Removed semicolon and non-breaking space
 
         except Exception as e:
             print(f"Error stopping old bot for user {user_id}: {e}")
@@ -114,23 +109,11 @@ async def rem_bot_token(C: Client, m: Message):
             if UB[user_id] and UB[user_id].is_connected: # Check if client exists and is connected
                 await UB[user_id].stop()
                 print(f"Stopped and removed old bot for user {user_id}")
-            del UB[user_id]  # Remove from dictionary
-             # Consider removing the session file if it was persisted
-            # try:
-            #     session_file = f"user_{user_id}.session"
-            #     if os.path.exists(session_file):
-            #          os.remove(session_file)
-            # except Exception: pass
+            del UB[user_id] # Remove from dictionary - FIXED: Removed semicolon and non-breaking space
 
         except Exception as e:
             print(f"Error stopping old bot for user {user_id}: {e}")
-            if user_id in UB: del UB[user_id]  # Ensure removal from dictionary
-             # Consider removing the session file if it was persisted
-            # try:
-            #     session_file = f"user_{user_id}.session"
-            #     if os.path.exists(session_file):
-            #          os.remove(session_file)
-            # except Exception: pass
+            if user_id in UB: del UB[user_id] # Ensure removal from dictionary
 
     try:
         success = await remove_user_bot(user_id)
@@ -145,8 +128,9 @@ async def rem_bot_token(C: Client, m: Message):
 
 
 @bot.on_message(login_in_progress & filters.text & filters.private & ~filters.command([
-    'start', 'batch', 'cancel', 'login', 'logout', 'stop', 'set', 'pay',
-    'redeem', 'gencode', 'generate', 'keyinfo', 'encrypt', 'decrypt', 'keys', 'setbot', 'rembot', 'settings', 'plan', 'terms', 'help', 'status', 'transfer', 'add', 'rem', 'dl', 'adl']))
+    'start', 'batch', 'cancel', 'login', 'logout', 'stop', 'set',
+    'pay', 'redeem', 'gencode', 'single', 'generate', 'keyinfo', 'encrypt', 'decrypt',
+    'keys', 'setbot', 'rembot', 'settings', 'plan', 'terms', 'help', 'status', 'transfer', 'add', 'rem', 'dl', 'adl']))
 async def handle_login_steps(client: Client, message: Message):
     """Handles user input during the login process."""
     user_id = message.from_user.id
@@ -172,9 +156,9 @@ async def handle_login_steps(client: Client, message: Message):
 
     try:
         if step == STEP_PHONE:
-            if not re.match(r'^\+\d+$', text): # Basic regex validation for phone number
+            if not re.match(r'^\+\d{7,15}$', text): # More specific regex for phone number (+ followed by 7-15 digits)
                 await edit_message_safely(status_msg,
-                    '❌ Please provide a valid phone number starting with `+` followed by digits.')
+                    '❌ Please provide a valid phone number starting with `+` followed by digits (e.g., `+12345678900`).')
                 # Stay in this step until valid input
                 return # Do not change step yet
 
@@ -194,6 +178,15 @@ async def handle_login_steps(client: Client, message: Message):
 
 Please enter the code you received (e.g., `1 2 3 4 5` or `12345`):""" # Clarified format
                     )
+            except FloodWait as e:
+                 # Handle flood wait specifically during send_code
+                 await edit_message_safely(status_msg,
+                    f"""⏳ FloodWait: You are trying too frequently. Please wait {e.value} seconds and try again with /login."""
+                    )
+                 # Clean up temporary client and state
+                 try: await temp_client.disconnect() except Exception: pass
+                 set_user_step(user_id, None)
+                 login_cache.pop(user_id, None)
             except BadRequest as e:
                  await edit_message_safely(status_msg,
                     f"""❌ Error sending code: {str(e)}
@@ -259,6 +252,15 @@ Please try again with /login."""
                     """🔒 Two-step verification is enabled.
 Please enter your password:"""
                     )
+            except FloodWait as e:
+                 # Handle flood wait specifically during sign_in
+                 await edit_message_safely(status_msg,
+                    f"""⏳ FloodWait: You are trying too frequently. Please wait {e.value} seconds and try again with /login."""
+                    )
+                 # Clean up temporary client and state
+                 try: await temp_client.disconnect() except Exception: pass
+                 login_cache.pop(user_id, None)
+                 set_user_step(user_id, None)
             except (PhoneCodeInvalid, PhoneCodeExpired) as e:
                 # Handle invalid or expired code
                 await edit_message_safely(status_msg,
@@ -306,6 +308,12 @@ Please try again with /login."""
                 await edit_message_safely(status_msg, """✅ Logged in successfully!! Your session is now active.""")
                 set_user_step(user_id, None) # Reset the user's step state
 
+            except FloodWait as e:
+                 # Handle flood wait specifically during check_password
+                 await edit_message_safely(status_msg,
+                    f"""⏳ FloodWait: You are trying too frequently. Please wait {e.value} seconds and try again with the password."""
+                    )
+                 # Stay in password step, user needs to wait and retry the password
             except BadRequest as e:
                 # Handle incorrect password
                 await edit_message_safely(status_msg,
@@ -340,9 +348,6 @@ Please try again with /login."""
         login_cache.pop(user_id, None) # Clean up user's state
         set_user_step(user_id, None) # Reset the user's step state
 
-# Note: The /cancel command handler is already present in plugins/start.py and plugins/batch.py.
-# A dedicated /cancel for the login process might be beneficial here to specifically clean up login state.
-# Let's add a /cancel handler specifically for the login process state.
 
 @bot.on_message(filters.command('cancel') & filters.private & login_in_progress)
 async def cancel_login_command(client: Client, message: Message):
